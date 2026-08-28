@@ -105,16 +105,18 @@ produced by `pg_dump --schema-only`, so it carries the **full constraint set**
 `plan` then runs a **verification (test) phase** so you can ship with confidence
 that the plan actually works:
 
-1. It takes a *full-data* dump of the target (`pg_dump`, not schema-only) and
-   spins that up in a second temporary database — a replica close to
-   production.
+1. It takes a *data* dump of just the tables being reconciled (`pg_dump`, not
+   schema-only, scoped to the same `-- T...` table list as the reference) and
+   spins it up in a second temporary database — a replica of the relevant
+   tables, with the real data.
 2. It applies the plan just written to `--output` against that replica.
 3. It compares the replica against the reference data. If they match, the plan
-   is confirmed to work in an environment much like production.
+   is confirmed to work against real data; if any reconciling table were
+   missed, the comparison would catch it.
 
 ```
 Plan written to: plan.sql (500 bytes)
-TEST PASSED: plan applied to a full copy of 'testdb' and matches the reference data.
+TEST PASSED: plan applied to a copy of 'testdb' and matches the reference data.
 ```
 
 If the replica does **not** match after applying the plan, `plan` fails with a

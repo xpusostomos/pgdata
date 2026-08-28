@@ -254,7 +254,7 @@ void testPhase(String host, String user, String liveDb, String schema, String tm
         dropDb(host, user, clone)
         new File(dataFile).delete()
     }
-    println("TEST PASSED: plan applied to a full copy of '$liveDb' and matches the reference data.")
+    println("TEST PASSED: plan applied to a copy of '$liveDb' and matches the reference data.")
 }
 
 // Thrown by testPhase on verification failure; the caller's finally still runs.
