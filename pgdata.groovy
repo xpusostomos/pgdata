@@ -8,13 +8,14 @@ import java.sql.DriverManager
 
 def CLI = """usage: pgdata.groovy <mode> <options>
 
-modes:
-  dump   --host H --db D --user U [--schema S] [-- TABLE ...]
+modes (TABLE ... is a list of table names; a leading '--' is optional;
+      --use-copy emits COPY ... FROM STDIN blocks instead of INSERTs):
+  dump   --host H --db D --user U [--schema S] [TABLE ...]
   list   --host H --db D --user U [--schema S]
-  plan   --host H --db D --user U [--schema S] --file input.sql --output plan.sql [-- TABLE ...]
-  dbplan --host1 H --db1 D --user1 U [--schema1 S] --host2 H --db2 D --user2 U [--schema2 S] [-- TABLE ...]
+  plan   --host H --db D --user U [--schema S] --file input.sql --output plan.sql [TABLE ...]
+  dbplan --host1 H --db1 D --user1 U [--schema1 S] --host2 H --db2 D --user2 U [--schema2 S] [TABLE ...]
   apply  --host H --db D --user U [--schema S] --plan plan.sql
-  apply  --host H --db D --user U [--schema S] --file input.sql [-- TABLE ...]
+  apply  --host H --db D --user U [--schema S] --file input.sql [TABLE ...]
 
 Passwords come from the environment:
   PGPASSWORD         modes that touch one live database (dump/list/plan/apply)
@@ -98,11 +99,19 @@ List<Map> rowsOf(Sql db, String schema, String table) {
 // That fidelity matters when a generated plan is tested against a copy of
 // production data. pg_dump --schema-only gives us a reliable, complete DDL.
 
+// Forward the password to the psql-family tools -- but only when PGPASSWORD is
+// actually set: ProcessBuilder rejects null values, and an unset variable should
+// fall through to the standard ~/.pgpass lookup (which pgjdbc already uses).
+void forwardPassword(ProcessBuilder pb) {
+    def pw = System.getenv('PGPASSWORD')
+    if (pw != null) pb.environment().put('PGPASSWORD', pw)
+}
+
 // Run an external process, forwarding PGPASSWORD, and return [exitCode, stdout].
 // When `outFile` is given, stdout is streamed to that file instead of captured.
 List runCmd(List cmd, String outFile = null) {
     def pb = new ProcessBuilder(cmd)
-    pb.environment().put('PGPASSWORD', System.getenv('PGPASSWORD'))
+    forwardPassword(pb)
     if (outFile) pb.redirectOutput(new File(outFile))
     def p = pb.start()
     def out = outFile ? '' : p.inputStream.text
@@ -123,24 +132,61 @@ void dumpSchemaOnly(String host, String user, String db, List<String> tables, St
     new File(outFile).write(res[1])
 }
 
+// Sequences referenced by the selected tables' column defaults
+// (e.g. DEFAULT nextval('shared_seq') -- a shared/global sequence is NOT owned
+// by the table, so pg_dump -t <table> does not include it, and the dumped
+// CREATE TABLE fails to load without it).
+List<String> dependentSequences(Sql src, String schema, List<String> tables) {
+    if (!tables) return []
+    def placeholders = (1..tables.size()).collect { '?' }.join(', ')
+    src.rows("""
+        SELECT DISTINCT seq.relname
+        FROM pg_class t
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        JOIN pg_attrdef d ON d.adrelid = t.oid
+        JOIN pg_depend dep ON dep.objid = d.oid
+               AND dep.classid = 'pg_attrdef'::regclass
+        JOIN pg_class seq ON seq.oid = dep.refobjid AND seq.relkind = 'S'
+        WHERE t.relkind = 'r'
+          AND tn.nspname = ?
+          AND t.relname IN ($placeholders)
+    """, [schema, *tables]).collect { it.relname }
+}
+
+// After a psql load, confirm every expected table really landed in the target
+// database; psql without ON_ERROR_STOP exits 0 past per-statement errors, so a
+// failed CREATE TABLE would otherwise surface later as a confusing error.
+void verifyTablesLoaded(Sql db, String schema, List<String> tables, String what, String logOutput) {
+    def missing = tables.findAll { !tableExists(db, schema, it) }
+    if (missing) {
+        System.err.println("FAILED: $what did not create table(s): ${missing.join(', ')} in schema $schema.")
+        System.err.println("The load tool reported:\n$logOutput")
+        // Throw (not System.exit) so the caller's finally still drops the temp DB.
+        throw new TestFailedException()
+    }
+}
+
 // Recreate a set of tables (from a schema-only dump) in the temp database.
-void loadSchemaDump(String host, String user, String db, List<String> tables, String tmpDb, String tmpDir) {
+String loadSchemaDump(String host, String user, String db, List<String> tables, String tmpDb, String tmpDir) {
     def schemaFile = (tmpDir + '/schema.sql') as String
     dumpSchemaOnly(host, user, db, tables, schemaFile)
     def pb = new ProcessBuilder(['psql', '-h', hostOf(host), '-p', portOf(host).toString(),
                                  '-U', user, '-f', schemaFile, tmpDb])
-    pb.environment().put('PGPASSWORD', System.getenv('PGPASSWORD'))
+    forwardPassword(pb)
     def p = pb.start()
     def out = p.inputStream.text
     def err = p.errorStream.text
     def code = p.waitFor()
     if (code != 0) { System.err.println("psql failed loading schema ($code)\n$err"); System.exit(1) }
+    // psql exits 0 even when individual statements error (no ON_ERROR_STOP): the
+    // caller must verify the tables actually landed (see verifyTablesLoaded).
+    out + err
 }
 
 // Clone the FULL data (not just schema) of the given tables into a temp database,
 // so the plan can be tested against a replica close to production. Uses --no-owner
 // / --no-privileges so it loads cleanly into a database owned by `user`.
-void loadFullData(String host, String user, String db, List<String> tables, String tmpDb, String tmpFile) {
+String loadFullData(String host, String user, String db, List<String> tables, String tmpDb, String tmpFile) {
     def cmd = ['pg_dump', '--no-owner', '--no-privileges', '-h', hostOf(host),
                '-p', portOf(host).toString(), '-U', user, '--dbname', db]
     tables.each { cmd += ['-t', it] }
@@ -148,10 +194,11 @@ void loadFullData(String host, String user, String db, List<String> tables, Stri
     if (res[0] != 0) System.exit(1)
     def pb = new ProcessBuilder(['psql', '-h', hostOf(host), '-p', portOf(host).toString(),
                                  '-U', user, '-f', tmpFile, tmpDb])
-    pb.environment().put('PGPASSWORD', System.getenv('PGPASSWORD'))
+    forwardPassword(pb)
     def p = pb.start()
     def out = p.inputStream.text; def err = p.errorStream.text; def code = p.waitFor()
     if (code != 0) { System.err.println("psql failed loading full data ($code)\n$err"); System.exit(1) }
+    out + err
 }
 
 // Run psql against a database with a SQL script file, letting errors surface.
@@ -161,7 +208,7 @@ List applyScriptPsql(String host, String user, String db, String scriptFile) {
     def logFile = File.createTempFile('pgdata_apply', '.log')
     def pb = new ProcessBuilder(['psql', '-h', hostOf(host), '-p', portOf(host).toString(),
                                  '-U', user, '-v', 'ON_ERROR_STOP=1', '-f', scriptFile, db])
-    pb.environment().put('PGPASSWORD', System.getenv('PGPASSWORD'))
+    forwardPassword(pb)
     pb.redirectErrorStream(true)
     def p = pb.start()
     def output = p.inputStream.text
@@ -180,7 +227,7 @@ List applyScriptPsql(String host, String user, String db, String scriptFile) {
 List<String> compareTables(String schema, String table, List<String> pkCols,
                            List<Map> rowsA, List<Map> rowsB) {
     def diffs = []
-    def sig = { r -> pkCols ? pkCols.collect { String.valueOf(r[it]) }.join('|') : (r.values().join('|')) }
+    def sig = { r -> pkCols ? pkCols.collect { String.valueOf(r[it]) }.join('\u0001') : (r.values().join('\u0001')) }
     def keyLabel = { r -> pkCols.collect { "$it=${lit('', r[it])}" }.join(', ') }
     // Clean value rendering (GroovyRowResult.toString appends a spurious [c]);
     // format as a SQL literal so values are obvious in the message.
@@ -223,12 +270,13 @@ List<String> compareDbs(Sql a, Sql b, String schema) {
 // reference database `refSql` (the desired final state). Prints test
 // confirmation or failure messages and uses the process exit code to signal.
 void testPhase(String host, String user, String liveDb, String schema, String tmpDir,
-               List<String> tables, Sql refSql, String planFile) {
+               List<String> tables, Sql refSql, String planFile, Sql srcDb) {
     def clone = makeTempDbName()
     def dataFile = (tmpDir + '/full_' + System.currentTimeMillis() + '.sql') as String
     createDb(host, user, clone)
     try {
-        loadFullData(host, user, liveDb, tables, clone, dataFile)
+        def rels = (tables + dependentSequences(srcDb, schema, tables)).unique()
+        def cloneLog = loadFullData(host, user, liveDb, rels, clone, dataFile)
 
         // Apply the plan to the replica. Capture + keep the log on failure so the
         // user can read exactly what went wrong.
@@ -241,6 +289,7 @@ void testPhase(String host, String user, String liveDb, String schema, String tm
         }
 
         def cloneSql = connect(hostOf(host), portOf(host), clone, user, System.getenv('PGPASSWORD'))
+        verifyTablesLoaded(cloneSql, schema, tables, 'the full-data clone', cloneLog)
         def diffs = compareDbs(refSql, cloneSql, schema)
         cloneSql.close()
 
@@ -269,12 +318,15 @@ class TestFailedException extends RuntimeException {
 // and load the reference INSERTs into it. Returns [sql, name] so the caller can
 // use the staging handle and, in a finally, drop the db by name.
 Map buildStaging(String host, String user, String liveDb, String schema, String tmpDir,
-                 List<String> tables, String referenceFile) {
+                 List<String> tables, String referenceFile, Sql srcDb) {
+    // The dump must also carry any shared sequences the tables' defaults use.
+    def rels = (tables + dependentSequences(srcDb, schema, tables)).unique()
     def name = makeTempDbName()
     createDb(host, user, name)
     def sql = connect(hostOf(host), portOf(host), name, user, System.getenv('PGPASSWORD'))
     try {
-        loadSchemaDump(host, user, liveDb, tables, name, tmpDir)
+        def loadLog = loadSchemaDump(host, user, liveDb, rels, name, tmpDir)
+        verifyTablesLoaded(sql, schema, tables, 'the staging schema load', loadLog)
         execSql(sql, new File(referenceFile).text)
     } catch (Throwable e) {
         sql.close(); dropDb(host, user, name); throw e
@@ -318,13 +370,60 @@ boolean sameValue(a, b) {
     a.equals(b)
 }
 
+// -- COPY text format (for --use-copy) --------------------------------------------
+
+// Escape a string for a COPY text-format field: backslash first, then the
+// special backslash sequences. A raw newline would break the row structure.
+String copyEscape(String s) {
+    s.replace('\\', '\\\\').replace('\b', '\\b').replace('\f', '\\f')
+     .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace('\u000b', '\\v')
+}
+
+// One value as a COPY text-format field: null is \N, boolean is t/f, bytea is
+// the hex form with its backslash escaped. Timestamps use ISO-8601 (the 'Z'
+// offset form round-trips timestamptz regardless of session timezone); unlike
+// SQL literals, no casts are possible here -- the column type governs.
+String copyField(String typ, v) {
+    if (v == null) return '\\N'
+    if (v instanceof Boolean) return v ? 't' : 'f'
+    if (v instanceof byte[]) return '\\\\x' + v.encodeHex().toString()
+    if (v instanceof Float || v instanceof Double) {
+        def d = v.doubleValue()
+        if (d.isNaN()) return 'NaN'
+        if (d.isInfinite()) return d > 0 ? 'Infinity' : '-Infinity'
+        return v.toString()
+    }
+    if (v instanceof java.sql.Timestamp) {
+        def tn = (typ ?: '').toLowerCase()
+        if (tn.contains('time zone') || tn == 'timestamptz') return v.toInstant().toString()
+        return v.toLocalDateTime().toString()
+    }
+    copyEscape(v.toString())
+}
+
+// A complete COPY block for `rows`: the FROM STDIN command, one tab-delimited
+// line per row, and the \. terminator. Used by dump (all rows) and by
+// plan/dbplan --use-copy (the rows that would have been INSERTs).
+String copyBlock(String table, Map colTypes, Collection rows) {
+    def cols = rows.head().keySet().toList()
+    def sb = new StringBuilder()
+    // Column names tab-separated after each comma, so the header line loads
+    // into a spreadsheet with the names in their own columns.
+    sb << "COPY $table (${cols.join(',\t')}) FROM STDIN;\n"
+    rows.each { r ->
+        sb << cols.collect { copyField(colTypes[it], r[it]) }.join('\t') << '\n'
+    }
+    sb << '\\.\n'
+    sb.toString()
+}
+
 String whereOnPk(Map colTypes, List pkCols, row) {
     pkCols.collect { c -> "$c = ${lit(colTypes[c], row[c])}" }.join(' AND ')
 }
 String insertInto(Map colTypes, String table, row) {
     def cols = row.keySet().toList()
     def vals = cols.collect { lit(colTypes[it], row[it]) }
-    "INSERT INTO $table (${cols.join(', ')}) VALUES (${vals.join(', ')});"
+    "INSERT INTO $table (${cols.join(', ')}) VALUES\n(${vals.join(', ')});"
 }
 String updateFrom(Map colTypes, String table, List pkCols, row, List diffCols) {
     def setClause = diffCols.collect { c -> "$c = ${lit(colTypes[c], row[c])}" }.join(', ')
@@ -362,15 +461,51 @@ List<String> splitStatements(String text) {
     out
 }
 
+// Execute a script that may interleave ordinary SQL statements with COPY ...
+// FROM STDIN blocks (as produced by dump/plan --use-copy). COPY data is fed to
+// the server through pgjdbc's CopyManager; the \. terminator is not passed
+// through (the JDBC COPY protocol ends at EOF).
 void execSql(Sql db, String script) {
-    splitStatements(script).each { stmt ->
+    def lines = script.readLines()
+    def plain = new StringBuilder()   // accumulated non-COPY SQL
+    int i = 0
+    while (i < lines.size()) {
+        def line = lines[i].trim()
+        if (line.isEmpty() || line.startsWith('--')) { i++; continue }
+        def m = line =~ /(?i)^COPY\s+.+\s+FROM\s+STDIN\s*;?\s*$/
+        if (m.matches()) {
+            if (plain.length() > 0) { runStatements(db, plain.toString()); plain = new StringBuilder() }
+            def copySql = line.replaceAll(/;\s*$/, '')
+            i++
+            def data = new StringBuilder()
+            while (i < lines.size() && lines[i].trim() != '\\.') {
+                data.append(lines[i]).append('\n'); i++
+            }
+            i++   // skip the \. terminator
+            copyIn(db, copySql, data.toString())
+        } else {
+            plain.append(lines[i]).append('\n'); i++
+        }
+    }
+    if (plain.length() > 0) runStatements(db, plain.toString())
+}
+
+// Run a block of ordinary (non-COPY) statements.
+void runStatements(Sql db, String text) {
+    splitStatements(text).each { stmt ->
         // A chunk may begin with a header comment (e.g. "-- Changes for table x")
-        // followed by the actual INSERT on the next line. Drop leading comment
+        // followed by the actual statement on the next line. Drop leading comment
         // lines and execute the remainder, so the first statement after a header
         // is not silently discarded.
         def sql = stmt.readLines().findAll { !(it =~ /^\s*--/) }.join('\n').trim()
         if (sql && !(sql =~ /(?i)^--/)) db.execute(sql)
     }
+}
+
+// Stream COPY data into the database through the JDBC copy API.
+void copyIn(Sql db, String copySql, String data) {
+    def pgConn = db.connection.unwrap(org.postgresql.PGConnection)
+    pgConn.copyAPI.copyIn(copySql, new StringReader(data))
 }
 
 // -- temp database lifecycle -----------------------------------------------------
@@ -395,21 +530,26 @@ void dropDb(String host, String user, String dbName) {
 // UPDATE / DELETE statements that bring the target in line with the source,
 // keyed on the primary key. No DB access.
 void reconcileTable(StringBuilder out, String table, Map colTypes, List pkCols,
-                    Collection srcRows, Collection tgtRows) {
-    def sig = { r -> pkCols.collect { String.valueOf(r[it]) }.join(' ') }
+                    Collection srcRows, Collection tgtRows, boolean useCopy = false) {
+    def sig = { r -> pkCols.collect { String.valueOf(r[it]) }.join('\u0001') }
     def srcByPk = [:]; srcRows.each { r -> srcByPk[sig(r)] = r }
     def tgtByPk = [:]; tgtRows.each { r -> tgtByPk[sig(r)] = r }
 
+    // INSERT/UPDATE/DELETE touch disjoint primary-key sets, so with --use-copy
+    // the rows that would be INSERTs are buffered into one COPY block.
+    def inserts = []
     srcRows.each { r ->
         def s = sig(r)
         def t = tgtByPk[s]
         if (t == null) {
-            out << insertInto(colTypes, table, r) << '\n'
+            if (useCopy) inserts << r
+            else out << insertInto(colTypes, table, r) << '\n'
         } else {
             def diff = r.keySet().findAll { c -> !sameValue(r[c], t[c]) } as List
             if (diff) out << updateFrom(colTypes, table, pkCols, r, diff) << '\n'
         }
     }
+    if (inserts) out << copyBlock(table, colTypes, inserts)
     tgtRows.each { r ->
         if (!srcByPk.containsKey(sig(r))) out << deleteFrom(colTypes, table, pkCols, r) << '\n'
     }
@@ -427,11 +567,27 @@ def rest = (argsList && argsList[0] in MODES) ? argsList[1..-1] : argsList
 
 def opts = [:]
 def allowed = ['--host', '--db', '--user', '--schema', '--host1', '--db1', '--user1', '--schema1',
-               '--host2', '--db2', '--user2', '--schema2', '--file', '--output', '--plan'] as Set
+               '--host2', '--db2', '--user2', '--schema2', '--file', '--output', '--plan', '--use-copy'] as Set
+def NO_VALUE_FLAGS = ['--use-copy'] as Set   // boolean flags: take no value
 def tableFilter = [] as List
 for (int i = 0; i < rest.size(); i++) {
-    if (rest[i] == '--') { tableFilter = rest[(i + 1)..-1]; break }
-    if (rest[i] in allowed && i + 1 < rest.size()) { opts[rest[i]] = rest[i + 1]; i++ }
+    def tok = rest[i]
+    if (tok == '--') { tableFilter += rest[(i + 1)..-1]; break }  // optional explicit separator
+    if (tok in allowed) {
+        if (NO_VALUE_FLAGS.contains(tok)) { opts[tok] = true }   // boolean flag
+        else {
+            if (i + 1 >= rest.size()) { System.err.println("option $tok requires a value\n$CLI"); System.exit(1) }
+            opts[tok] = rest[i + 1]; i++
+        }
+    } else if (tok.startsWith('--')) {
+        // A word starting with -- that is not a known option: fail loudly so a
+        // typo (--hos) is not silently mistaken for a table name.
+        System.err.println("unrecognized option: $tok\n$CLI"); System.exit(1)
+    } else {
+        // Every option takes exactly one value, so a bare word can only be a
+        // table name. No '--' separator required.
+        tableFilter << tok
+    }
 }
 
 def TMP_DIR = (File.createTempDir())?.absolutePath ?: System.getProperty('java.io.tmpdir')
@@ -476,7 +632,8 @@ if (mode == 'dump') {
         if (!rows) return
         out << "-- Changes for table $table\n"
         def colT = columnTypes(db, schema, table)
-        rows.each { out << insertInto(colT, qname(schema, table), it) << '\n' }
+        if (opts['--use-copy']) out << copyBlock(qname(schema, table), colT, rows)
+        else rows.each { out << insertInto(colT, qname(schema, table), it) << '\n' }
     }
     out << '-- Done.\n'
     print out.toString()
@@ -498,7 +655,7 @@ if (mode == 'dbplan') {
         def colT = columnTypes(db1, s1, table)
         def pk = primaryKey(db1, s1, table)
         def rows2 = targetRows(db2, s2, table)
-        reconcileTable(out, qname(s2, table), colT, pk, rows1, rows2)
+        reconcileTable(out, qname(s2, table), colT, pk, rows1, rows2, opts['--use-copy'] as boolean)
     }
     out << '-- Done.\n'
     print out.toString()
@@ -531,7 +688,7 @@ if (mode == 'apply') {
                 plan << "-- Changes for table $table\n"
                 def colT = columnTypes(td, schema, table)
                 def pk = primaryKey(td, schema, table)
-                reconcileTable(plan, qname(schema, table), colT, pk, rows, rowsOf(db, schema, table))
+                reconcileTable(plan, qname(schema, table), colT, pk, rows, rowsOf(db, schema, table), opts['--use-copy'] as boolean)
             }
             execSql(db, plan.toString())
             td.close()
@@ -556,7 +713,7 @@ if (mode == 'plan') {
     def pw = System.getenv('PGPASSWORD')
     def db = side('', pw)
     // BEGINNING: the first (staging) temp database = reference data.
-    def st = buildStaging(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(db, schema), g('--file'))
+    def st = buildStaging(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(db, schema), g('--file'), db)
     try {
         def td = st.sql
         def out = new StringBuilder()
@@ -567,14 +724,14 @@ if (mode == 'plan') {
             def colT = columnTypes(td, schema, table)
             def pk = primaryKey(td, schema, table)
             def tgtRows = targetRows(db, schema, table)
-            reconcileTable(out, qname(schema, table), colT, pk, srcRows, tgtRows)
+            reconcileTable(out, qname(schema, table), colT, pk, srcRows, tgtRows, opts['--use-copy'] as boolean)
         }
         out << '-- Done.\n'
         new File(pPath).write(out.toString())
         System.out.println("Plan written to: $pPath (${out.length()} bytes)")
 
         // END: the test phase — confirm the plan applies to a full copy of the target.
-        testPhase(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(td, schema), td, pPath)
+        testPhase(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(td, schema), td, pPath, db)
     } catch (TestFailedException e) {
         // testPhase has already printed the details; ensure temp DBs are cleaned.
         st.sql.close()
@@ -598,9 +755,9 @@ if (mode == 'test') {
     String h = g('--host')
     def pw = System.getenv('PGPASSWORD')
     def db = side('', pw)
-    def st = buildStaging(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(db, schema), g('--file'))
+    def st = buildStaging(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(db, schema), g('--file'), db)
     try {
-        testPhase(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(st.sql, schema), st.sql, pPath)
+        testPhase(h, g('--user'), g('--db'), schema, TMP_DIR, effectiveTables(st.sql, schema), st.sql, pPath, db)
     } catch (TestFailedException e) {
         st.sql.close()
         dropDb(h, g('--user'), st.name)

@@ -24,8 +24,16 @@ bad() { FAIL=$((FAIL+1)); echo "ERROR: $1" >&2; }
 # if any prior assertion failed, bail (set -e would already catch many)
 checkpoint() { if [[ $FAIL -ne 0 ]]; then echo "Aborting early due to prior failures."; exit 1; fi; }
 
-reset_dbs() { ./test/schema.sh >/dev/null; ./test/populate_db1.sh >/dev/null; ./test/populate_db2.sh >/dev/null; }
-np_dbs() { psql -U postgres -tAc "select count(*) from pg_database where datname like 'tmp_pgdata_%'"; }
+reset_dbs() {
+    # Clear any stale temp databases from previous (possibly crashed) runs so the
+    # temp-DB-leak assertions only ever see leaks from THIS run.
+    psql -X -U postgres -tAc "select datname from pg_database where datname like 'tmp_pgdata_%'" 2>/dev/null \
+        | while read -r d; do [[ -n "$d" ]] && dropdb --if-exists --force -U postgres "$d" >/dev/null 2>&1; done
+    ./test/schema.sh >/dev/null; ./test/populate_db1.sh >/dev/null; ./test/populate_db2.sh >/dev/null
+}
+# -X skips ~/.psqlrc (which may print notices like "Pager usage is off." on
+# stdout); tr keeps only digits so stray output can never fake a non-zero count.
+np_dbs() { psql -X -U postgres -tAc "select count(*) from pg_database where datname like 'tmp_pgdata_%'" 2>/dev/null | tr -dc '0-9'; }
 
 reset_dbs
 
@@ -81,6 +89,42 @@ PGPASSWORD=pgtestpw groovy "$PGDATA" test --host localhost --db "$DB2" --user pg
     --file "$WORK/ref.sql" --plan "$WORK/planB.sql" > "$WORK/testC.out" 2>&1
 grep -q "TEST PASSED" "$WORK/testC.out" && ok "test mode passes on good plan" || bad "test mode failed on good plan"
 [[ "$(np_dbs)" == "0" ]] && ok "no temp DBs after test success" || bad "test leaked temp DBs"
+checkpoint
+
+# =============================================================================
+echo "C2. --use-copy: COPY format dump, round-trip load, COPY in plan"
+reset_dbs
+PGPASSWORD=pgtestpw groovy "$PGDATA" dump --host localhost --db "$DB1" --user pgtest --use-copy all_types \
+    > "$WORK/copydump.sql" 2>/dev/null
+
+echo "  assertions:"
+grep -qP '^COPY "public"\."all_types" \(id,\tb,\tsi,' "$WORK/copydump.sql" \
+    && ok "COPY header with tab-separated column names" || bad "COPY header missing tabs"
+grep -qP '\tt\t|^t\t' "$WORK/copydump.sql" && ok "boolean as t/f" || bad "boolean not t/f"
+grep -qF '\\x0001ff' "$WORK/copydump.sql" && ok "bytea as escaped hex" || bad "bytea wrong"
+grep -qF $'\t\\N\t' "$WORK/copydump.sql" && ok "null as \N" || bad "null not \\N"
+grep -qF "a\\\\b" "$WORK/copydump.sql" && ok "backslash escaped in text" || bad "backslash not escaped"
+grep -qx '\\.' "$WORK/copydump.sql" && ok "\. terminator present" || bad "missing \\."
+
+# COPY-format dump feeds plan as the reference (CopyManager load path)
+PGPASSWORD=pgtestpw groovy "$PGDATA" plan --host localhost --db "$DB2" --user pgtest \
+    --file "$WORK/copydump.sql" --output "$WORK/planC2.sql" > "$WORK/c2.out" 2>/dev/null
+grep -q "TEST PASSED" "$WORK/c2.out" && ok "COPY-format reference loads and verifies" || bad "COPY reference round-trip failed"
+
+# plan --use-copy emits COPY for INSERT rows; apply --plan loads it via execSql
+reset_dbs
+PGPASSWORD=pgtestpw groovy "$PGDATA" dump --host localhost --db "$DB1" --user pgtest users products \
+    > "$WORK/refC2.sql" 2>/dev/null
+PGPASSWORD=pgtestpw groovy "$PGDATA" plan --host localhost --db "$DB2" --user pgtest \
+    --file "$WORK/refC2.sql" --output "$WORK/planUC.sql" --use-copy >/dev/null 2>&1
+grep -qE '^COPY ' "$WORK/planUC.sql" && ok "plan --use-copy emits COPY block" || bad "plan lacks COPY block"
+PGPASSWORD=pgtestpw groovy "$PGDATA" apply --host localhost --db "$DB2" --user pgtest \
+    --plan "$WORK/planUC.sql" >/dev/null 2>&1
+ndiff=$(PGPASSWORD1=pgtestpw PGPASSWORD2=pgtestpw groovy "$PGDATA" dbplan \
+    --host1 localhost --host2 localhost --db1 "$DB1" --db2 "$DB2" \
+    --user1 pgtest --user2 pgtest -- users products 2>/dev/null | grep -cvE '^-- |^$' || true)
+[[ "$ndiff" == "0" ]] && ok "COPY plan applies and converges (scoped tables)" || bad "COPY plan left $ndiff diffs"
+[[ "$(np_dbs)" == "0" ]] && ok "no temp DBs after use-copy section" || bad "use-copy leaked temp DBs"
 checkpoint
 
 # =============================================================================

@@ -52,6 +52,11 @@ Passwords are never on the command line; they come from the environment:
 | `PGPASSWORD` | single-database modes (`list`, `dump`, `plan`, `apply`) |
 | `PGPASSWORD1` / `PGPASSWORD2` | `dbplan` (the two live databases) |
 
+If `PGPASSWORD` is unset, pgdata falls back to the standard `~/.pgpass` lookup
+— for the JDBC connections and equally for the `psql`-family tools it runs
+(`createdb`, `pg_dump`, `psql`, `dropdb`), so a working `.pgpass` entry is
+enough on its own.
+
 ## The workflow
 
 The same loop as pgschema — **capture → plan → apply** — but for data.
@@ -75,6 +80,27 @@ definition, just as `schema.sql` is pgschema's:
 ./pgdata.groovy dump --host localhost --db devdb --user app \
     -- country currency > reference.sql
 ```
+
+#### Fast bulk format: `--use-copy`
+
+Add `--use-copy` and `dump` emits PostgreSQL `COPY ... FROM STDIN` blocks
+instead of `INSERT` statements — far faster to load and friendly to
+spreadsheets, since the column names are tab-separated after each comma:
+
+```
+-- Changes for table country
+COPY "public"."country" (iso,	name) FROM STDIN;
+AU	Australia
+NZ	New Zealand
+\.
+```
+
+COPY text format applies: fields are tab-delimited, `\N` is NULL, booleans are
+`t`/`f`, `bytea` is hex (`\\x…`), and backslash/tab/newline are escaped. The
+same flag works on `plan`/`dbplan`/`apply`: the rows that would be `INSERT`s
+are emitted as one `COPY` block per table (an `UPDATE`/`DELETE` cannot be
+expressed as `COPY`, so those stay as SQL). Files in this format load fine
+wherever pgdata consumes SQL — `plan --file`, `apply --plan`, and psql.
 
 `reference.sql` (`INSERT` statements, one per row, with explicit keys):
 
