@@ -9,7 +9,7 @@ import java.sql.DriverManager
 def CLI = """usage: pgdata.groovy <mode> <options>
 
 modes (TABLE ... is a list of table names; a leading '--' is optional;
-      --use-copy emits COPY ... FROM STDIN blocks instead of INSERTs):
+      COPY is the default output; --use-insert emits INSERT statements instead):
   dump   --host H --db D --user U [--schema S] [TABLE ...]
   list   --host H --db D --user U [--schema S]
   plan   --host H --db D --user U [--schema S] --file input.sql --output plan.sql [TABLE ...]
@@ -567,8 +567,9 @@ def rest = (argsList && argsList[0] in MODES) ? argsList[1..-1] : argsList
 
 def opts = [:]
 def allowed = ['--host', '--db', '--user', '--schema', '--host1', '--db1', '--user1', '--schema1',
-               '--host2', '--db2', '--user2', '--schema2', '--file', '--output', '--plan', '--use-copy'] as Set
-def NO_VALUE_FLAGS = ['--use-copy'] as Set   // boolean flags: take no value
+               '--host2', '--db2', '--user2', '--schema2', '--file', '--output', '--plan', '--use-copy', '--use-insert'] as Set
+def NO_VALUE_FLAGS = ['--use-copy', '--use-insert'] as Set   // boolean flags: take no value
+// COPY blocks are the default output format; --use-insert switches back to INSERTs.
 def tableFilter = [] as List
 for (int i = 0; i < rest.size(); i++) {
     def tok = rest[i]
@@ -595,6 +596,8 @@ addShutdownHook { File dir = new File("$TMP_DIR"); if (dir.exists()) dir.deleteD
 
 int portOf(String s) { s && s.contains(':') ? (s.split(':')[1] as int) : 5432 }
 String hostOf(String s) { s && s.contains(':') ? s.split(':')[0] : s }
+// COPY blocks are the default output format; --use-insert switches back to INSERTs.
+def useCopy = !opts['--use-insert']
 def g = { String f -> opts[f] }
 def need = { String f ->
     if (!opts['--' + f]) { System.err.println("missing required option --$f\n$CLI"); System.exit(1) }
@@ -632,7 +635,7 @@ if (mode == 'dump') {
         if (!rows) return
         out << "-- Changes for table $table\n"
         def colT = columnTypes(db, schema, table)
-        if (opts['--use-copy']) out << copyBlock(qname(schema, table), colT, rows)
+        if (useCopy) out << copyBlock(qname(schema, table), colT, rows)
         else rows.each { out << insertInto(colT, qname(schema, table), it) << '\n' }
     }
     out << '-- Done.\n'
@@ -655,7 +658,7 @@ if (mode == 'dbplan') {
         def colT = columnTypes(db1, s1, table)
         def pk = primaryKey(db1, s1, table)
         def rows2 = targetRows(db2, s2, table)
-        reconcileTable(out, qname(s2, table), colT, pk, rows1, rows2, opts['--use-copy'] as boolean)
+        reconcileTable(out, qname(s2, table), colT, pk, rows1, rows2, useCopy)
     }
     out << '-- Done.\n'
     print out.toString()
@@ -688,7 +691,7 @@ if (mode == 'apply') {
                 plan << "-- Changes for table $table\n"
                 def colT = columnTypes(td, schema, table)
                 def pk = primaryKey(td, schema, table)
-                reconcileTable(plan, qname(schema, table), colT, pk, rows, rowsOf(db, schema, table), opts['--use-copy'] as boolean)
+                reconcileTable(plan, qname(schema, table), colT, pk, rows, rowsOf(db, schema, table), useCopy)
             }
             execSql(db, plan.toString())
             td.close()
@@ -724,7 +727,7 @@ if (mode == 'plan') {
             def colT = columnTypes(td, schema, table)
             def pk = primaryKey(td, schema, table)
             def tgtRows = targetRows(db, schema, table)
-            reconcileTable(out, qname(schema, table), colT, pk, srcRows, tgtRows, opts['--use-copy'] as boolean)
+            reconcileTable(out, qname(schema, table), colT, pk, srcRows, tgtRows, useCopy)
         }
         out << '-- Done.\n'
         new File(pPath).write(out.toString())

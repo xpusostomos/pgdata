@@ -12,8 +12,9 @@ that script for you.
 `pgdata` is a single self-contained Groovy script (`pgdata.groovy`) that drives
 two reconciliation styles and everything needed around them:
 
-- **`plan`** — compare a *script of INSERTs* against a live database, and print
-  the change script to bring the database in line with the script.
+- **`plan`** — compare a *script of reference data* (COPY blocks or INSERTs)
+  against a live database, and write the change script that brings the
+  database in line with it.
 - **`dbplan`** — compare two *live databases* directly and print the change
   script to reconcile the second to the first.
 
@@ -72,8 +73,8 @@ PGPASSWORD=secret ./pgdata.groovy dump \
     --host localhost --db devdb --user app -- country currency
 ```
 
-This connects only to `devdb` and prints an `INSERT` per row of the listed
-tables. Empty tables are skipped. Save it — it becomes your canonical data
+This connects only to `devdb` and prints a `COPY` block per listed table (or
+`INSERT` per row with `--use-insert`). Empty tables are skipped. Save it — it becomes your canonical data
 definition, just as `schema.sql` is pgschema's:
 
 ```bash
@@ -81,11 +82,12 @@ definition, just as `schema.sql` is pgschema's:
     -- country currency > reference.sql
 ```
 
-#### Fast bulk format: `--use-copy`
+#### Output format: COPY by default, `--use-insert` to opt out
 
-Add `--use-copy` and `dump` emits PostgreSQL `COPY ... FROM STDIN` blocks
-instead of `INSERT` statements — far faster to load and friendly to
-spreadsheets, since the column names are tab-separated after each comma:
+By default `dump` (and the INSERT portion of `plan`/`dbplan`) emits PostgreSQL
+`COPY ... FROM STDIN` blocks — far faster to load and friendly to
+spreadsheets, since the column names are tab-separated after each comma. 
+If you load this into Libreoffice, set delimiter to tab and string delimiter to nothing. You will get a nice spreadsheet to edit where the headings actually line up:
 
 ```
 -- Changes for table country
@@ -96,13 +98,17 @@ NZ	New Zealand
 ```
 
 COPY text format applies: fields are tab-delimited, `\N` is NULL, booleans are
-`t`/`f`, `bytea` is hex (`\\x…`), and backslash/tab/newline are escaped. The
-same flag works on `plan`/`dbplan`/`apply`: the rows that would be `INSERT`s
+`t`/`f`, `bytea` is hex (`\\x…`), and backslash/tab/newline are escaped.
+`plan`/`dbplan` use the same format: the rows that would be `INSERT`s
 are emitted as one `COPY` block per table (an `UPDATE`/`DELETE` cannot be
 expressed as `COPY`, so those stay as SQL). Files in this format load fine
 wherever pgdata consumes SQL — `plan --file`, `apply --plan`, and psql.
 
-`reference.sql` (`INSERT` statements, one per row, with explicit keys):
+Pass `--use-insert` to any of these modes to get classic `INSERT` statements
+instead — for example when you want to hand-edit the reference data as SQL.
+
+`reference.sql` (COPY blocks by default, one per table, with explicit keys —
+add `--use-insert` for INSERT statements):
 
 ```sql
 INSERT INTO "public"."country" (iso, name) VALUES ('AU', 'Australia');
@@ -221,7 +227,7 @@ statements.
 
 | Command | What it does |
 |---|---|
-| `pgdata.groovy dump --host H --db D --user U [--schema S] [-- T...]` | Print `INSERT`s for the listed tables (or all non-empty). |
+| `pgdata.groovy dump --host H --db D --user U [--schema S] [-- T...]` | Print the listed tables (or all non-empty) as `COPY` blocks; `--use-insert` for `INSERT`s. |
 | `pgdata.groovy list --host H --db D --user U [--schema S]` | Print names of tables that have data, one per line. |
 | `pgdata.groovy plan --host H --db D --user U [--schema S] --file f.sql --output plan.sql` | Diff `f.sql` (INSERTs) against `D`, write the change script to `plan.sql`, then run the verification phase. |
 | `pgdata.groovy test --host H --db D --user U [--schema S] --file f.sql --plan plan.sql` | Run only the verification phase for an existing `plan.sql`. |

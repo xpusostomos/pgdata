@@ -41,7 +41,7 @@ reset_dbs
 echo "== A. dbplan (db-to-db): generate, assert, apply, converge =="
 run_dbplan() { PGPASSWORD1=pgtestpw PGPASSWORD2=pgtestpw groovy "$PGDATA" dbplan \
     --host1 localhost --host2 localhost --db1 "$DB1" --db2 "$DB2" \
-    --user1 pgtest --user2 pgtest; }
+    --user1 pgtest --user2 pgtest --use-insert; }
 run_dbplan > "$WORK/a1.sql" 2>/dev/null
 grep -vE '^-- |^$' "$WORK/a1.sql" > "$WORK/a1data.txt" || true
 
@@ -94,7 +94,7 @@ checkpoint
 # =============================================================================
 echo "C2. --use-copy: COPY format dump, round-trip load, COPY in plan"
 reset_dbs
-PGPASSWORD=pgtestpw groovy "$PGDATA" dump --host localhost --db "$DB1" --user pgtest --use-copy all_types \
+PGPASSWORD=pgtestpw groovy "$PGDATA" dump --host localhost --db "$DB1" --user pgtest all_types \
     > "$WORK/copydump.sql" 2>/dev/null
 
 echo "  assertions:"
@@ -116,7 +116,7 @@ reset_dbs
 PGPASSWORD=pgtestpw groovy "$PGDATA" dump --host localhost --db "$DB1" --user pgtest users products \
     > "$WORK/refC2.sql" 2>/dev/null
 PGPASSWORD=pgtestpw groovy "$PGDATA" plan --host localhost --db "$DB2" --user pgtest \
-    --file "$WORK/refC2.sql" --output "$WORK/planUC.sql" --use-copy >/dev/null 2>&1
+    --file "$WORK/refC2.sql" --output "$WORK/planUC.sql" >/dev/null 2>&1
 grep -qE '^COPY ' "$WORK/planUC.sql" && ok "plan --use-copy emits COPY block" || bad "plan lacks COPY block"
 PGPASSWORD=pgtestpw groovy "$PGDATA" apply --host localhost --db "$DB2" --user pgtest \
     --plan "$WORK/planUC.sql" >/dev/null 2>&1
@@ -125,6 +125,13 @@ ndiff=$(PGPASSWORD1=pgtestpw PGPASSWORD2=pgtestpw groovy "$PGDATA" dbplan \
     --user1 pgtest --user2 pgtest -- users products 2>/dev/null | grep -cvE '^-- |^$' || true)
 [[ "$ndiff" == "0" ]] && ok "COPY plan applies and converges (scoped tables)" || bad "COPY plan left $ndiff diffs"
 [[ "$(np_dbs)" == "0" ]] && ok "no temp DBs after use-copy section" || bad "use-copy leaked temp DBs"
+# --use-insert opts back out of the COPY default
+PGPASSWORD=pgtestpw groovy "$PGDATA" dump --host localhost --db "$DB1" --user pgtest \
+    --use-insert users > "$WORK/insdump.sql" 2>/dev/null
+grep -q '^INSERT INTO "public"."users"' "$WORK/insdump.sql" \
+    && ok "--use-insert emits INSERT statements" || bad "--use-insert did not emit INSERTs"
+grep -qE '^COPY ' "$WORK/insdump.sql" && bad "--use-insert must not emit COPY" \
+    || ok "--use-insert emits no COPY blocks"
 checkpoint
 
 # =============================================================================
