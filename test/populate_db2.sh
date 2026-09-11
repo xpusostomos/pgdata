@@ -13,5 +13,6 @@ import data/users_db2.sql
 import data/products_db2.sql
 import data/all_types_db2.sql
 import data/enrollments_db2.sql
+import data/keyless_db2.sql
 
 echo "db2 populated (users, products, all_types)"

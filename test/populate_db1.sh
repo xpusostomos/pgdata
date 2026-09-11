@@ -13,6 +13,7 @@ import data/users_db1.sql
 import data/products_db1.sql
 import data/all_types_db1.sql
 import data/enrollments_db1.sql
+import data/keyless_db1.sql
 
 echo "db1 populated (users, products, all_types)"
 echo "next: ./populate_db2.sh"

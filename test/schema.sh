@@ -67,6 +67,14 @@ CREATE TABLE enrollments (
     term       DATE,
     PRIMARY KEY (student_id, course_id)
 );
+-- Table WITHOUT a primary key: every column acts as the key, so reconciliation
+-- can only INSERT or DELETE (a changed row is deleted and re-inserted, never
+-- UPDATEd), and NULL columns must become `IS NULL` in the DELETE WHERE clause.
+CREATE TABLE keyless_notes (
+    tag        TEXT,
+    note       TEXT,
+    sort_order INT
+);
 -- Table that is intentionally empty in db1 (must be ignored by pgdata).
 CREATE TABLE empty_table (
     id   SERIAL PRIMARY KEY,

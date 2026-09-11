@@ -36,6 +36,14 @@ is a feature and a constraint:
 A `dump` will always emit the primary key explicitly, so data round-tripped
 through `dump` → `plan` is safe.
 
+**Tables without a primary key:** every column is notionally the key. The
+consequence is that reconciliation can only ever `INSERT` or `DELETE` — with
+all columns in the key, no two distinct rows share an identity, so a changed
+row is deleted and re-inserted rather than `UPDATE`d, and `NULL` columns become
+`IS NULL` in the `WHERE` clause. This is exactly the semantics you want for
+unordered keyless data; it does mean duplicate rows in a keyless table are
+treated as one identity and cannot be reconciled by multiplicity.
+
 ## Prerequisites
 
 - **groovy** with Grapes support (the JDBC driver is fetched automatically).

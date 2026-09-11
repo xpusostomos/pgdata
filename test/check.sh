@@ -52,6 +52,21 @@ grep -qF "O''Brien" "$WORK/a1data.txt" && ok "single-quote escaping" || bad "quo
 grep -qF 'DELETE FROM "public"."users" WHERE id = 5;' "$WORK/a1data.txt" && ok "users DELETE (ghost)" || bad "missing users DELETE"
 grep -q '^INSERT INTO "public"."enrollments"' "$WORK/a1data.txt" && ok "enrollments INSERT" || bad "missing enrollments INSERT"
 grep -q "empty_table" "$WORK/a1data.txt" && bad "empty_table must be ignored" || ok "empty_table ignored"
+# keyless table (no PK): every column is the key -> INSERT/DELETE only, never
+# UPDATE; NULL key columns must become `IS NULL` in the DELETE WHERE clause.
+grep -qF "INSERT INTO \"public\".\"keyless_notes\" (tag, note, sort_order) VALUES ('B', 'note-b', 2);" "$WORK/a1data.txt" \
+    && ok "keyless INSERT (changed row re-inserted)" || bad "missing keyless INSERT"
+grep -qF "INSERT INTO \"public\".\"keyless_notes\" (tag, note, sort_order) VALUES ('C', NULL, 3);" "$WORK/a1data.txt" \
+    && ok "keyless INSERT with NULL value" || bad "missing keyless NULL INSERT"
+grep -qF 'DELETE FROM "public"."keyless_notes" WHERE tag = '"'"'B'"'"' AND note = '"'"'note-old'"'"' AND sort_order = 2;' "$WORK/a1data.txt" \
+    && ok "keyless DELETE spans every column" || bad "keyless DELETE WHERE incomplete"
+grep -qF 'DELETE FROM "public"."keyless_notes" WHERE tag = '"'"'D'"'"' AND note = '"'"'note-d'"'"' AND sort_order IS NULL;' "$WORK/a1data.txt" \
+    && ok "keyless DELETE uses IS NULL for NULLs" || bad "keyless DELETE missing IS NULL"
+if grep -qF 'UPDATE "public"."keyless_notes"' "$WORK/a1data.txt"; then
+  bad "keyless table must never produce UPDATE"
+else
+  ok "no UPDATE for keyless table"
+fi
 # composite pk WHERE spans both cols
 if ! grep -E '"public"."enrollments"' "$WORK/a1data.txt" | grep "WHERE" \
       | grep -qvE "WHERE student_id = [0-9]+ AND course_id = '[^']*'"; then

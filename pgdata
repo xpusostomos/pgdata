@@ -227,7 +227,7 @@ List applyScriptPsql(String host, String user, String db, String scriptFile) {
 List<String> compareTables(String schema, String table, List<String> pkCols,
                            List<Map> rowsA, List<Map> rowsB) {
     def diffs = []
-    def sig = { r -> pkCols ? pkCols.collect { String.valueOf(r[it]) }.join('\u0001') : (r.values().join('\u0001')) }
+    def sig = { r -> pkCols.collect { sigVal(r[it]) }.join('\u0001') }
     def keyLabel = { r -> pkCols.collect { "$it=${lit('', r[it])}" }.join(', ') }
     // Clean value rendering (GroovyRowResult.toString appends a spurious [c]);
     // format as a SQL literal so values are obvious in the message.
@@ -259,7 +259,7 @@ List<String> compareDbs(Sql a, Sql b, String schema) {
         def rowsA = rowsOf(a, schema, table)
         if (!rowsA) return
         def rowsB = rowsOf(b, schema, table)
-        def pk = primaryKey(a, schema, table)
+        def pk = rowKeyColumns(a, schema, table, columnTypes(a, schema, table))
         diffs.addAll(compareTables(schema, table, pk, rowsA, rowsB))
     }
     diffs
@@ -370,6 +370,23 @@ boolean sameValue(a, b) {
     a.equals(b)
 }
 
+// String form of a value for row-identity signatures: type-tagged so that a
+// NULL, a byte[], and an ordinary text value can never collide, and byte[] is
+// hashed by CONTENT (String.valueOf on a byte[] is an identity hash).
+String sigVal(v) {
+    if (v == null) return 'N'
+    if (v instanceof byte[]) return 'B' + (v as byte[]).encodeHex().toString()
+    'V' + String.valueOf(v)
+}
+
+// The identity of a row: its primary key -- or, for a table WITHOUT one, every
+// column. With all columns in the key, no two distinct rows share an identity,
+// so keyless tables reconcile via INSERT/DELETE only (a changed row is deleted
+// and re-inserted); nothing can ever qualify for UPDATE.
+List<String> rowKeyColumns(Sql db, String schema, String table, Map colTypes) {
+    primaryKey(db, schema, table) ?: colTypes.keySet().toList()
+}
+
 // -- COPY text format (for --use-copy) --------------------------------------------
 
 // Escape a string for a COPY text-format field: backslash first, then the
@@ -418,12 +435,15 @@ String copyBlock(String table, Map colTypes, Collection rows) {
 }
 
 String whereOnPk(Map colTypes, List pkCols, row) {
-    pkCols.collect { c -> "$c = ${lit(colTypes[c], row[c])}" }.join(' AND ')
+    pkCols.collect { c ->
+        def v = row[c]
+        (v == null) ? "$c IS NULL" : "$c = ${lit(colTypes[c], v)}"
+    }.join(' AND ')
 }
 String insertInto(Map colTypes, String table, row) {
     def cols = row.keySet().toList()
     def vals = cols.collect { lit(colTypes[it], row[it]) }
-    "INSERT INTO $table (${cols.join(', ')}) VALUES\n(${vals.join(', ')});"
+    "INSERT INTO $table (${cols.join(', ')}) VALUES (${vals.join(', ')});"
 }
 String updateFrom(Map colTypes, String table, List pkCols, row, List diffCols) {
     def setClause = diffCols.collect { c -> "$c = ${lit(colTypes[c], row[c])}" }.join(', ')
@@ -531,7 +551,7 @@ void dropDb(String host, String user, String dbName) {
 // keyed on the primary key. No DB access.
 void reconcileTable(StringBuilder out, String table, Map colTypes, List pkCols,
                     Collection srcRows, Collection tgtRows, boolean useCopy = false) {
-    def sig = { r -> pkCols.collect { String.valueOf(r[it]) }.join('\u0001') }
+    def sig = { r -> pkCols.collect { sigVal(r[it]) }.join('\u0001') }
     def srcByPk = [:]; srcRows.each { r -> srcByPk[sig(r)] = r }
     def tgtByPk = [:]; tgtRows.each { r -> tgtByPk[sig(r)] = r }
 
@@ -656,7 +676,7 @@ if (mode == 'dbplan') {
         if (!rows1) return
         out << "-- Changes for table $table\n"
         def colT = columnTypes(db1, s1, table)
-        def pk = primaryKey(db1, s1, table)
+        def pk = rowKeyColumns(db1, s1, table, colT)
         def rows2 = targetRows(db2, s2, table)
         reconcileTable(out, qname(s2, table), colT, pk, rows1, rows2, useCopy)
     }
@@ -690,7 +710,7 @@ if (mode == 'apply') {
                 if (!rows) return
                 plan << "-- Changes for table $table\n"
                 def colT = columnTypes(td, schema, table)
-                def pk = primaryKey(td, schema, table)
+                def pk = rowKeyColumns(td, schema, table, colT)
                 reconcileTable(plan, qname(schema, table), colT, pk, rows, rowsOf(db, schema, table), useCopy)
             }
             execSql(db, plan.toString())
@@ -725,7 +745,7 @@ if (mode == 'plan') {
             if (!srcRows) return
             out << "-- Changes for table $table\n"
             def colT = columnTypes(td, schema, table)
-            def pk = primaryKey(td, schema, table)
+            def pk = rowKeyColumns(td, schema, table, colT)
             def tgtRows = targetRows(db, schema, table)
             reconcileTable(out, qname(schema, table), colT, pk, srcRows, tgtRows, useCopy)
         }
